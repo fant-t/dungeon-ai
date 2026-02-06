@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Vibe Dungeon v9.4 - Consistent Map</title>
+    <style>
+        body { 
+            margin: 0; overflow: hidden; background: #050505; 
+            touch-action: none; font-family: 'Consolas', monospace; color: #0f0;
+            user-select: none; -webkit-user-select: none;
+        }
+        canvas { display: block; cursor: crosshair; }
+
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        
+        #monitor {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(0, 0, 0, 0.8); border: 1px solid #00ff00;
+            padding: 10px; width: 200px; font-size: 11px; pointer-events: none;
+        }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 2px; }
+        .highlight { color: #ff0; font-weight: bold; }
+
+        #weapon-card {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            background: rgba(0, 20, 0, 0.9); border: 2px solid #00ffcc;
+            padding: 10px 20px; text-align: center; border-radius: 10px;
+            pointer-events: auto; cursor: pointer; transition: transform 0.1s;
+        }
+        #weapon-card:active { transform: translateX(-50%) scale(0.95); }
+        #w-name { font-size: 16px; font-weight: bold; color: #fff; }
+        #w-type { font-size: 10px; color: #aaa; text-transform: uppercase; }
+
+        #level-splash {
+            position: absolute; top: 30%; left: 0; width: 100%; text-align: center;
+            font-size: 40px; color: white; font-weight: bold; text-shadow: 0 0 20px cyan;
+            opacity: 0; transition: opacity 1s; pointer-events: none;
+        }
+        
+        #controls {
+            position: absolute; top: 10px; right: 10px;
+            background: rgba(0, 20, 0, 0.9); border: 1px solid #00ff00;
+            padding: 10px; width: 180px; font-size: 10px; pointer-events: auto;
+        }
+        .ctrl-group { margin-bottom: 5px; }
+        input[type=checkbox] { vertical-align: middle; }
+        
+        #game-over {
+            display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9); z-index: 100; pointer-events: auto;
+            flex-direction: column; justify-content: center; align-items: center;
+        }
+        #restart-btn {
+            padding: 15px 30px; background: #333; color: white; border: 2px solid white;
+            font-size: 20px; cursor: pointer; text-transform: uppercase; margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="monitor">
+            <div class="stat-row"><span>Level:</span> <span id="val-lvl" class="highlight">1</span></div>
+            <div class="stat-row"><span>Status:</span> <span id="val-lock" style="color:cyan">SAFE</span></div>
+            <div class="stat-row"><span>Enemies:</span> <span id="val-active">0</span></div>
+            <div class="stat-row"><span>Map Size:</span> <span id="val-rooms">0</span></div>
+        </div>
+        <div id="weapon-card" onclick="cycleWeapon()">
+            <div id="w-name">PISTOL</div>
+            <div id="w-type">Ranged • TAP TO SWAP</div>
+        </div>
+        <div id="level-splash">FLOOR 1</div>
+    </div>
+
+    <div id="game-over">
+        <div style="color:red; font-size:50px; font-weight:bold; text-shadow: 0 0 20px red;">YOU DIED</div>
+        <div id="restart-btn" onclick="resetGame()">RESTART RUN</div>
+    </div>
+
+    <div id="controls">
+        <div class="ctrl-group"><label><input type="checkbox" onchange="updateSet('god', this.checked)"> God Mode</label></div>
+        <div class="ctrl-group"><label><input type="checkbox" onchange="updateSet('noclip', this.checked)"> Noclip</label></div>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    // --- CONFIG ---
+    const TILE_SIZE = 64; 
+    const MAP_W = 100; const MAP_H = 100;
+    
+    // --- WEAPONS ---
+    const WEAPONS = [
+        { id: 'pistol', name: 'PISTOL', type: 'ranged', damage: 4, cd: 30, range: 550, speed: 20, count: 1, spread: 0, color: '#ff0' },
+        { id: 'shotgun', name: 'SHOTGUN', type: 'ranged', damage: 2, cd: 70, range: 350, speed: 16, count: 6, spread: 0.4, color: '#f00' },
+        { id: 'crossbow', name: 'CROSSBOW', type: 'ranged', damage: 15, cd: 60, range: 800, speed: 30, count: 1, spread: 0, color: '#0f0' },
+        { id: 'knife', name: 'KNIFE', type: 'melee', damage: 5, cd: 15, range: 90, arc: 1.0, knockback: 4, color: '#fff' },
+        { id: 'katana', name: 'KATANA', type: 'melee', damage: 8, cd: 40, range: 140, arc: 2.0, knockback: 8, color: '#0ff' },
+        { id: 'spear', name: 'SPEAR', type: 'melee', damage: 7, cd: 50, range: 190, arc: 0.5, knockback: 14, color: '#fa0' } 
+    ];
+
+    let state = {
+        level: 1, currentRoomIdx: -1, zoom: 0.7,
+        kills: 0, shake: 0, isDead: false, transitioning: false,
+        godMode: false, noclip: false, enemyHpScale: 1.0, weaponIdx: 0
+    };
+
+    const player = {
+        x: 0, y: 0, r: 15, hitbox: 10, color: '#00ffcc',
+        vx: 0, vy: 0, acc: 1.2, fric: 0.85, maxSpd: 9, 
+        lastShot: 0, angle: 0
+    };
+
+    let map = []; let floorDetails = []; let rooms = []; let bullets = []; let enemies = []; let particles = []; let spawnBeacons = []; let meleeSwings = [];
+    const keys = {}; const mouse = { x:0, y:0, down:false };
+    const stickL = { active:false, id:null, sx:0, sy:0, cx:0, cy:0, vx:0, vy:0 };
+    const stickR = { active:false, id:null, sx:0, sy:0, cx:0, cy:0, vx:0, vy:0 };
+    const JOY_R = 70;
+
+    // --- GENERATION v9.4 (Consistent Size) ---
+    function generateLevel() {
+        let attempts = 0;
+        let success = false;
+        
+        // Cố định số lượng phòng: Min 6, Max 12 (kể cả Boss/Start)
+        // Level càng cao càng tiến về 12, nhưng không bao giờ dài hơn.
+        const TARGET_ROOMS = Math.min(12, Math.max(6, 6 + Math.floor(state.level * 0.5)));
+
+        // Vòng lặp Retry: Nếu map tạo ra < 6 phòng -> Làm lại
+        while(!success && attempts < 100) {
+            attempts++;
+            
+            // 1. Reset Temp Data
+            map = []; floorDetails = []; rooms = []; 
+            for(let y=0; y<MAP_H; y++) { map.push(new Array(MAP_W).fill(0)); floorDetails.push(new Array(MAP_W).fill(0)); }
+            
+            const dig = (x,y,w,h) => { for(let i=y; i<y+h; i++) for(let j=x; j<x+w; j++) map[i][j]=1; };
+            const digPath = (x1,y1,x2,y2) => { let x=x1, y=y1; while(x!=x2) { map[y][x]=1; map[y+1][x]=1; x+=(x2>x)?1:-1; } while(y!=y2) { map[y][x]=1; map[y][x+1]=1; y+=(y2>y)?1:-1; } };
+
+            let cx = Math.floor(MAP_W/2), cy = Math.floor(MAP_H/2);
+            let startRoom = { x: cx-6, y: cy-6, w: 12, h: 12, type: 'start', index: 0, doorTiles: [], visited: true };
+            rooms.push(startRoom); dig(startRoom.x, startRoom.y, startRoom.w, startRoom.h);
+
+            // 2. Try to build chain
+            let currentRoom = startRoom;
+            for(let i=1; i<TARGET_ROOMS; i++) {
+                let added = false;
+                let dirs = [{dx:0,dy:-1},{dx:0,dy:1},{dx:-1,dy:0},{dx:1,dy:0}].sort(()=>Math.random()-0.5);
+                for(let dir of dirs) {
+                    let w = 12 + Math.floor(Math.random()*6); 
+                    let h = 12 + Math.floor(Math.random()*6); 
+                    // GIẢM KHOẢNG CÁCH (14-20) thay vì 20-30 để map gọn hơn
+                    let dist = 14 + Math.floor(Math.random()*6); 
+                    
+                    let nx = currentRoom.x + (currentRoom.w/2) - (w/2) + (dir.dx * dist);
+                    let ny = currentRoom.y + (currentRoom.h/2) - (h/2) + (dir.dy * dist);
+                    
+                    if(nx<2 || nx>MAP_W-w-2 || ny<2 || ny>MAP_H-h-2) continue;
+                    
+                    // Check Overlap with Rooms AND Corridors
+                    let overlap = false; 
+                    // Scan area
+                    for(let yy=Math.floor(ny)-2; yy<Math.floor(ny)+h+2; yy++) 
+                        for(let xx=Math.floor(nx)-2; xx<Math.floor(nx)+w+2; xx++) 
+                            if(map[yy] && map[yy][xx] !== 0) overlap = true;
+
+                    if(!overlap) {
+                        let newRoom = { x: Math.floor(nx), y: Math.floor(ny), w, h, type: 'normal', index: i, doorTiles: [], visited: false };
+                        dig(newRoom.x, newRoom.y, newRoom.w, newRoom.h);
+                        digPath(currentRoom.x+Math.floor(currentRoom.w/2), currentRoom.y+Math.floor(currentRoom.h/2), newRoom.x+Math.floor(newRoom.w/2), newRoom.y+Math.floor(newRoom.h/2));
+                        rooms.push(newRoom); currentRoom = newRoom; added = true; break;
+                    }
+                }
+                if(!added) break; // Kẹt, dừng chuỗi
+            }
+
+            // 3. Validate Map Size
+            if(rooms.length >= 6) { // Yêu cầu tối thiểu 6 phòng (tính cả start)
+                success = true;
+            }
+        }
+
+        console.log("Map generated in " + attempts + " attempts. Size: " + rooms.length);
+
+        // --- POST PROCESSING (Sau khi có map chuẩn) ---
+        
+        // 1. Reset Game Entities
+        enemies = []; bullets = []; particles = []; spawnBeacons = []; meleeSwings = [];
+        state.currentRoomIdx = -1;
+
+        // 2. Set Player Pos
+        let start = rooms[0];
+        player.x = (start.x + start.w/2) * TILE_SIZE; 
+        player.y = (start.y + start.h/2) * TILE_SIZE;
+        player.vx = 0; player.vy = 0;
+
+        // 3. Set Boss & Exit
+        let bossRoom = rooms[rooms.length-1]; 
+        bossRoom.type = 'boss';
+
+        // Place Exit
+        let exitPlaced = false; 
+        let exitDirs = [{dx:0,dy:-1},{dx:0,dy:1},{dx:-1,dy:0},{dx:1,dy:0}].sort(()=>Math.random()-0.5);
+        const dig = (x,y,w,h) => { for(let i=y; i<y+h; i++) for(let j=x; j<x+w; j++) map[i][j]=1; };
+        const digPath = (x1,y1,x2,y2) => { let x=x1, y=y1; while(x!=x2) { map[y][x]=1; map[y+1][x]=1; x+=(x2>x)?1:-1; } while(y!=y2) { map[y][x]=1; map[y][x+1]=1; y+=(y2>y)?1:-1; } };
+
+        for(let dir of exitDirs) {
+            let ew=6, eh=6; 
+            let ex = bossRoom.x + Math.floor(bossRoom.w/2) - (ew/2) + (dir.dx * (bossRoom.w/2 + 6)); 
+            let ey = bossRoom.y + Math.floor(bossRoom.h/2) - (eh/2) + (dir.dy * (bossRoom.h/2 + 6));
+            
+            if(ex<2 || ex>MAP_W-ew-2 || ey<2 || ey>MAP_H-eh-2) continue;
+            
+            // Check Void
+            let isFree = true;
+            for(let yy=Math.floor(ey)-1; yy<Math.floor(ey)+eh+1; yy++) 
+                for(let xx=Math.floor(ex)-1; xx<Math.floor(ex)+ew+1; xx++) 
+                    if(map[yy] && map[yy][xx] !== 0) isFree = false;
+            
+            if(isFree) {
+                let exitRoom = { x:Math.floor(ex), y:Math.floor(ey), w:ew, h:eh, type:'exit', index:999, doorTiles:[], visited:true };
+                dig(exitRoom.x, exitRoom.y, exitRoom.w, exitRoom.h);
+                digPath(bossRoom.x+Math.floor(bossRoom.w/2), bossRoom.y+Math.floor(bossRoom.h/2), exitRoom.x+Math.floor(ew/2), exitRoom.y+Math.floor(eh/2));
+                rooms.push(exitRoom); exitPlaced = true; break;
+            }
+        }
+        if(!exitPlaced) { // Fallback
+            let exitRoom={x:bossRoom.x+1, y:bossRoom.y+1, w:2, h:2, type:'exit', index:999, doorTiles:[], visited:true}; 
+            dig(exitRoom.x, exitRoom.y, exitRoom.w, exitRoom.h); 
+            rooms.push(exitRoom); 
+        }
+
+        // 4. Decor & Gates & Safe Spawn
+        for(let r of rooms) {
+            for(let i=r.y; i<r.y+r.h; i++) for(let j=r.x; j<r.x+r.w; j++) { if(Math.random()<0.1) floorDetails[i][j]=1; if(Math.random()<0.05) floorDetails[i][j]=2; }
+            if(r.type!=='start' && r.type!=='exit') { for(let x=r.x; x<r.x+r.w; x++){checkGate(r,x,r.y-1);checkGate(r,x,r.y+r.h);} for(let y=r.y; y<r.y+r.h; y++){checkGate(r,r.x-1,y);checkGate(r,r.x+r.w,y);} }
+        }
+        let px = Math.floor(player.x/TILE_SIZE), py = Math.floor(player.y/TILE_SIZE);
+        for(let yy=py-1; yy<=py+1; yy++) for(let xx=px-1; xx<=px+1; xx++) if(yy>=0 && yy<MAP_H && xx>=0 && xx<MAP_W) map[yy][xx]=1;
+        
+        // Update UI info
+        document.getElementById('val-rooms').innerText = rooms.length;
+    }
+    function checkGate(room, x, y) { if(x>=0 && x<MAP_W && y>=0 && y<MAP_H && map[y][x]===1) { map[y][x]=3; room.doorTiles.push({x, y}); } }
+
+    function triggerRoom(room) {
+        if(room.visited || room.type === 'start' || room.type === 'exit') return;
+        room.visited = true;
+        let enemyCount = 0;
+        if(room.type === 'normal') {
+            enemyCount = 3 + Math.floor(Math.random()*3) + state.level;
+            for(let k=0; k<enemyCount; k++) createSpawnBeacon(room, false);
+        } else if (room.type === 'boss') {
+            createSpawnBeacon(room, true);
+            enemyCount = 4;
+            for(let k=0; k<3; k++) createSpawnBeacon(room, false);
+        }
+    }
+
+    function createSpawnBeacon(r, isBoss) {
+        let ex, ey;
+        for(let attempt=0; attempt<10; attempt++) {
+            ex = (r.x + 1 + Math.random()*(r.w-2)) * TILE_SIZE;
+            ey = (r.y + 1 + Math.random()*(r.h-2)) * TILE_SIZE;
+            let dx=ex-player.x; let dy=ey-player.y; if(dx*dx+dy*dy > 250*250) break; 
+        }
+        spawnBeacons.push({ x: ex, y: ey, room: r, isBoss: isBoss, timer: 60 });
+    }
+
+    function spawnEnemyAt(x, y, r, isBoss) {
+        let hp = isBoss ? 25*state.level : 3*state.level;
+        let spd = isBoss ? 1.0 : (0.5 + Math.random()*0.5); 
+        hp *= state.enemyHpScale;
+        enemies.push({ x:x, y:y, r:isBoss?40:20, hitbox:isBoss?30:15, color:isBoss?'#ff0000':'#ff4444', maxHp:hp, hp:hp, vx:0, vy:0, speed:spd, isBoss:isBoss, roomIndex:r.index });
+    }
+
+    function nextLevel() {
+        if(state.transitioning) return; state.transitioning = true; 
+        for(let k in keys) keys[k]=false; stickL.active=false; stickL.vx=0; stickL.vy=0; stickR.active=false; stickR.vx=0; stickR.vy=0; mouse.down=false;
+        state.level++; let splash = document.getElementById('level-splash'); splash.innerText="FLOOR "+state.level; splash.style.opacity=1;
+        setTimeout(() => { generateLevel(); splash.style.opacity=0; state.transitioning=false; }, 1500);
+    }
+
+    function performAttack(wpn) {
+        let aimX=0, aimY=0;
+        if(stickR.active && (Math.abs(stickR.vx)>0.1 || Math.abs(stickR.vy)>0.1)) { aimX=stickR.vx; aimY=stickR.vy; }
+        else if(mouse.down) { let dx=mouse.x-canvas.width/2; let dy=mouse.y-canvas.height/2; let d=Math.sqrt(dx*dx+dy*dy); if(d>0){aimX=dx/d; aimY=dy/d;} }
+        else return;
+
+        let angle = Math.atan2(aimY, aimX);
+        player.angle = angle;
+
+        if(wpn.type === 'ranged') {
+            for(let i=0; i<wpn.count; i++) {
+                let spread = (Math.random() - 0.5) * wpn.spread;
+                let finalAngle = angle + spread;
+                let vx = Math.cos(finalAngle) * wpn.speed;
+                let vy = Math.sin(finalAngle) * wpn.speed;
+                bullets.push({x:player.x, y:player.y, vx:vx, vy:vy, life:wpn.range/wpn.speed, dmg:wpn.damage, color:wpn.color});
+            }
+            state.shake = 3;
+        }
+        else if(wpn.type === 'melee') {
+            meleeSwings.push({ x:player.x, y:player.y, angle:angle, arc:wpn.arc, range:wpn.range, life:10, maxLife:10, color:wpn.color, damage:wpn.damage, knockback:wpn.knockback, hitList: [] });
+            state.shake = 5;
+        }
+    }
+
+    function update() {
+        if(state.isDead || state.transitioning) return;
+
+        let pgx = Math.floor(player.x/TILE_SIZE); let pgy = Math.floor(player.y/TILE_SIZE);
+        let currentRoom = rooms.find(r => pgx>=r.x && pgx<r.x+r.w && pgy>=r.y && pgy<r.y+r.h);
+        
+        let activeEnemies = 0;
+        let onDoor = false;
+
+        if(currentRoom) {
+            state.currentRoomIdx = currentRoom.index;
+            triggerRoom(currentRoom);
+            if(currentRoom.type==='exit') nextLevel();
+
+            activeEnemies = enemies.filter(e => e.roomIndex === currentRoom.index).length + spawnBeacons.filter(b => b.room.index === currentRoom.index).length;
+            
+            for(let g of currentRoom.doorTiles) {
+                if (player.x+player.hitbox > g.x*TILE_SIZE && player.x-player.hitbox < g.x*TILE_SIZE+TILE_SIZE &&
+                    player.y+player.hitbox > g.y*TILE_SIZE && player.y-player.hitbox < g.y*TILE_SIZE+TILE_SIZE) onDoor = true;
+            }
+            let gateState = (activeEnemies > 0 && !state.godMode && !onDoor) ? 2 : 3;
+            for(let g of currentRoom.doorTiles) map[g.y][g.x] = gateState;
+            
+            let uiLock = document.getElementById('val-lock');
+            if(gateState===2) { uiLock.innerText="LOCKED"; uiLock.style.color="red"; } else { uiLock.innerText="SAFE"; uiLock.style.color="cyan"; }
+        }
+
+        // Door Push Out (Fix Kẹt Cửa Vật Lý)
+        if(map[pgy][pgx] === 2 && currentRoom && !state.noclip) {
+            let cx=(currentRoom.x+currentRoom.w/2)*TILE_SIZE; let cy=(currentRoom.y+currentRoom.h/2)*TILE_SIZE;
+            let dx=cx-player.x; let dy=cy-player.y; let dist=Math.sqrt(dx*dx+dy*dy);
+            if(dist>0) { player.vx+=(dx/dist)*2.0; player.vy+=(dy/dist)*2.0; }
+        }
+
+        for(let i=spawnBeacons.length-1; i>=0; i--) {
+            let b = spawnBeacons[i]; b.timer--;
+            if(b.timer <= 0) { spawnEnemyAt(b.x, b.y, b.room, b.isBoss); createParticles(b.x, b.y, '#fff', 15); spawnBeacons.splice(i,1); }
+        }
+
+        let ix=0, iy=0; if(keys['KeyW']) iy-=1; if(keys['KeyS']) iy+=1; if(keys['KeyA']) ix-=1; if(keys['KeyD']) ix+=1;
+        if(stickL.active) { ix=stickL.vx; iy=stickL.vy; } let mag=Math.sqrt(ix*ix+iy*iy); if(mag>1){ix/=mag; iy/=mag;}
+        if(mag>0){player.vx+=ix*player.acc; player.vy+=iy*player.acc;} else{player.vx*=player.fric; player.vy*=player.fric;}
+        let spd=Math.sqrt(player.vx**2+player.vy**2); if(spd>player.maxSpd){let s=player.maxSpd/spd; player.vx*=s; player.vy*=s;}
+        player.x+=player.vx; resolveCollision(player,'x'); player.y+=player.vy; resolveCollision(player,'y');
+
+        let wpn = WEAPONS[state.weaponIdx];
+        let aim = (stickR.active && (Math.abs(stickR.vx)>0.1 || Math.abs(stickR.vy)>0.1)) || mouse.down;
+        let now = performance.now();
+        if(aim && now - player.lastShot > wpn.cd) { performAttack(wpn); player.lastShot = now; }
+
+        updateEntities();
+        document.getElementById('val-lvl').innerText = state.level; document.getElementById('val-active').innerText = enemies.length;
+        if(state.shake>0){state.shake*=0.9; if(state.shake<0.5)state.shake=0;}
+    }
+
+    function resolveCollision(obj, axis) {
+        if(state.noclip && obj===player) return;
+        let r = obj.hitbox || obj.r; 
+        let checks = [];
+        if(axis === 'x') { checks.push({x: obj.x + r, y: obj.y - r + 2}); checks.push({x: obj.x + r, y: obj.y + r - 2}); checks.push({x: obj.x - r, y: obj.y - r + 2}); checks.push({x: obj.x - r, y: obj.y + r - 2}); }
+        else { checks.push({x: obj.x - r + 2, y: obj.y + r}); checks.push({x: obj.x + r - 2, y: obj.y + r}); checks.push({x: obj.x - r + 2, y: obj.y - r}); checks.push({x: obj.x + r - 2, y: obj.y - r}); }
+
+        for(let p of checks) {
+            let tx = Math.floor(p.x / TILE_SIZE); let ty = Math.floor(p.y / TILE_SIZE);
+            let tile = map[ty] ? map[ty][tx] : 0;
+            if(tile === 0 || tile === 2) { // Wall or Locked Door (Treat as wall for physics)
+                 if(axis === 'x') {
+                     if(obj.vx > 0) obj.x = tx * TILE_SIZE - r - 0.1; else obj.x = tx * TILE_SIZE + TILE_SIZE + r + 0.1; obj.vx = 0; 
+                 } else {
+                     if(obj.vy > 0) obj.y = ty * TILE_SIZE - r - 0.1; else obj.y = ty * TILE_SIZE + TILE_SIZE + r + 0.1; obj.vy = 0;
+                 }
+                 break;
+            }
+        }
+    }
+
+    function updateEntities() {
+        for(let i=bullets.length-1; i>=0; i--) {
+            let b=bullets[i]; b.x+=b.vx; b.y+=b.vy; b.life--; let gx=Math.floor(b.x/TILE_SIZE), gy=Math.floor(b.y/TILE_SIZE); let tile=map[gy]?map[gy][gx]:0;
+            if(tile===0||tile===2){createParticles(b.x,b.y,b.color,3); bullets.splice(i,1); continue;} if(b.life<=0){bullets.splice(i,1); continue;}
+            for(let j=enemies.length-1; j>=0; j--){let e=enemies[j]; if(e.roomIndex!==state.currentRoomIdx)continue; if((b.x-e.x)**2+(b.y-e.y)**2<(e.r+10)**2){e.hp-=b.dmg; createParticles(b.x,b.y,'#fff',3); bullets.splice(i,1); if(e.hp<=0){createParticles(e.x,e.y,e.color,15); enemies.splice(j,1); state.kills++; state.shake=8;} break;}}
+        }
+
+        for(let i=meleeSwings.length-1; i>=0; i--) {
+            let s = meleeSwings[i]; s.life--; if(s.life <= 0) { meleeSwings.splice(i,1); continue; }
+            for(let e of enemies) {
+                if(e.roomIndex !== state.currentRoomIdx) continue;
+                if(s.hitList.includes(e)) continue;
+                let dx = e.x - s.x; let dy = e.y - s.y;
+                let dist = Math.sqrt(dx*dx + dy*dy);
+                if(dist < s.range + e.r) {
+                    let enemyAngle = Math.atan2(dy, dx);
+                    let angleDiff = enemyAngle - s.angle;
+                    while(angleDiff > Math.PI) angleDiff -= Math.PI*2; while(angleDiff < -Math.PI) angleDiff += Math.PI*2;
+                    if(Math.abs(angleDiff) < s.arc / 2) {
+                        e.hp -= s.damage; e.vx += Math.cos(enemyAngle) * s.knockback * 2; e.vy += Math.sin(enemyAngle) * s.knockback * 2;
+                        createParticles(e.x, e.y, '#fff', 5); s.hitList.push(e);
+                        if(e.hp<=0) { createParticles(e.x, e.y, e.color, 15); e.dead=true; state.kills++; state.shake=8; }
+                    }
+                }
+            }
+        }
+        enemies = enemies.filter(e => !e.dead);
+
+        for(let e of enemies) {
+            if(e.roomIndex!==state.currentRoomIdx) continue;
+            let dx=player.x-e.x, dy=player.y-e.y, dist=Math.sqrt(dx*dx+dy*dy); if(dist>0){e.vx+=(dx/dist)*e.speed; e.vy+=(dy/dist)*e.speed;}
+            for(let other of enemies){if(e===other)continue; if(other.roomIndex!==state.currentRoomIdx)continue; let odx=e.x-other.x, ody=e.y-other.y, odist=Math.sqrt(odx*odx+ody*ody); if(odist<e.r+other.r&&odist>0){e.vx+=(odx/odist)*0.5; e.vy+=(ody/odist)*0.5;}}
+            let gx=Math.floor(e.x/TILE_SIZE), gy=Math.floor(e.y/TILE_SIZE); if(map[gy] && map[gy][gx]===0 && dist>0) { e.x += (dx/dist)*2; e.y += (dy/dist)*2; }
+            e.vx*=0.9; e.vy*=0.9; e.x+=e.vx; resolveCollision(e,'x'); e.y+=e.vy; resolveCollision(e,'y');
+            if(!state.godMode&&(player.x-e.x)**2+(player.y-e.y)**2<(e.r+player.r)**2){state.isDead=true; state.shake=30; document.getElementById('game-over').style.display='flex';}
+        }
+        for(let i=particles.length-1; i>=0; i--){let p=particles[i]; p.x+=p.vx; p.y+=p.vy; p.vx*=0.9; p.vy*=0.9; p.life--; if(p.life<=0)particles.splice(i,1);}
+    }
+    function createParticles(x,y,c,count){for(let i=0; i<count; i++){let a=Math.random()*Math.PI*2, s=Math.random()*5+2; particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:30+Math.random()*20,color:c,size:Math.random()*4+2});}}
+
+    function cycleWeapon() {
+        state.weaponIdx = (state.weaponIdx + 1) % WEAPONS.length;
+        let w = WEAPONS[state.weaponIdx];
+        document.getElementById('w-name').innerText = w.name;
+        document.getElementById('w-type').innerText = w.type.toUpperCase() + " • TAP TO SWAP";
+    }
+    window.addEventListener('keydown', e=>{ keys[e.code]=true; if(e.code==='Space') cycleWeapon(); });
+
+    function draw() {
+        if(canvas.width!=window.innerWidth) canvas.width=window.innerWidth;
+        if(canvas.height!=window.innerHeight) canvas.height=window.innerHeight;
+        ctx.fillStyle = '#050505'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        let sx = (Math.random()-0.5)*state.shake, sy = (Math.random()-0.5)*state.shake;
+        ctx.translate(canvas.width/2 + sx, canvas.height/2 + sy);
+        ctx.scale(state.zoom, state.zoom); ctx.translate(-player.x, -player.y);
+
+        let vw = canvas.width/state.zoom, vh = canvas.height/state.zoom;
+        let c1=Math.floor((player.x-vw/2)/TILE_SIZE)-1, c2=c1+vw/TILE_SIZE+3;
+        let r1=Math.floor((player.y-vh/2)/TILE_SIZE)-1, r2=r1+vh/TILE_SIZE+3;
+
+        for(let y=r1; y<=r2; y++) for(let x=c1; x<=c2; x++) if(y>=0 && y<MAP_H && x>=0 && x<MAP_W) {
+            let tile = map[y][x];
+            if(tile > 0) { 
+                let floorColor = '#1a1a1a'; let gridColor = '#333';
+                if(tile === 2) { floorColor = '#400'; gridColor='#700'; } 
+                else if(tile === 3) { floorColor = '#040'; gridColor='#070'; } 
+                else {
+                    let room = rooms.find(r => x>=r.x && x<r.x+r.w && y>=r.y && y<r.y+r.h);
+                    if(room) { 
+                        if(room.type==='start') { floorColor='#1a2230'; gridColor='#2a3240'; }
+                        if(room.type==='normal'){ floorColor='#202020'; gridColor='#303030'; }
+                        if(room.type==='boss') { floorColor='#301a1a'; gridColor='#402a2a'; }
+                        if(room.type==='exit') { floorColor='#1a301a'; gridColor='#2a402a'; }
+                    }
+                }
+                ctx.fillStyle = floorColor; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE+1, TILE_SIZE+1);
+                ctx.strokeStyle = gridColor; ctx.lineWidth = 1; ctx.strokeRect(x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                if(tile===2 || tile===3) { ctx.fillStyle = (tile===2)?'red':'#0f0'; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, 6); ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE+TILE_SIZE-6, TILE_SIZE, 6); }
+                if(floorDetails[y][x] === 1) { ctx.fillStyle = gridColor; ctx.fillRect(x*TILE_SIZE+10, y*TILE_SIZE+10, 5, 5); } 
+            }
+        }
+        for(let y=r1; y<=r2; y++) for(let x=c1; x<=c2; x++) if(y>=0 && y<MAP_H && x>=0 && x<MAP_W) {
+            if(map[y][x] === 0) {
+                ctx.fillStyle = '#111'; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                ctx.fillStyle = '#222'; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, 4);
+                ctx.fillStyle = '#000'; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE+TILE_SIZE-4, TILE_SIZE, 4);
+                if(y+1 < MAP_H && map[y+1][x] !== 0) {
+                    let frontHeight = TILE_SIZE * 0.6;
+                    ctx.fillStyle = '#0a0a0a'; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE+TILE_SIZE, TILE_SIZE, frontHeight);
+                    ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fillRect(x*TILE_SIZE, y*TILE_SIZE+TILE_SIZE, TILE_SIZE, frontHeight/2);
+                }
+            }
+        }
+        for(let b of spawnBeacons) {
+            ctx.save(); let alpha = 0.5 + Math.sin(performance.now()/100)*0.3;
+            ctx.beginPath(); ctx.arc(b.x, b.y, (b.isBoss?40:20) * (b.timer/60), 0, Math.PI*2);
+            ctx.strokeStyle = `rgba(255, 0, 0, ${alpha})`; ctx.lineWidth = 3; ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(b.x, b.y-1000); ctx.lineTo(b.x, b.y);
+            ctx.strokeStyle = `rgba(255, 50, 50, ${b.timer/60})`; ctx.lineWidth = b.isBoss?4:2; ctx.stroke();
+            ctx.restore();
+        }
+        for(let p of particles) { ctx.fillStyle=p.color; ctx.globalAlpha=p.life/30; ctx.fillRect(p.x,p.y,p.size,p.size); }
+        ctx.globalAlpha=1.0;
+        for(let b of bullets) { ctx.fillStyle=b.color; ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI*2); ctx.fill(); }
+        
+        for(let s of meleeSwings) {
+            ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(s.angle);
+            ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0, 0, s.range, -s.arc/2, s.arc/2); ctx.closePath();
+            ctx.fillStyle = s.color; ctx.globalAlpha = s.life/s.maxLife * 0.5; ctx.fill();
+            ctx.strokeStyle = s.color; ctx.globalAlpha = 1; ctx.lineWidth = 2; ctx.stroke();
+            ctx.restore();
+        }
+
+        for(let e of enemies) {
+            if(e.roomIndex !== state.currentRoomIdx) continue;
+            ctx.fillStyle=e.color; 
+            if(e.isBoss) { ctx.shadowBlur=30; ctx.shadowColor='red'; ctx.fillRect(e.x-e.r, e.y-e.r, e.r*2, e.r*2); ctx.shadowBlur=0; ctx.fillStyle='black'; ctx.fillRect(e.x-30, e.y-e.r-15, 60, 8); ctx.fillStyle='red'; ctx.fillRect(e.x-30, e.y-e.r-15, 60*(e.hp/e.maxHp), 8); } 
+            else { ctx.fillRect(e.x-e.r, e.y-e.r, e.r*2, e.r*2); }
+        }
+        ctx.fillStyle=player.color; ctx.shadowBlur=15; ctx.shadowColor=player.color; ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI*2); ctx.fill(); ctx.shadowBlur=0;
+        
+        let wpn = WEAPONS[state.weaponIdx];
+        ctx.save(); ctx.translate(player.x, player.y); 
+        if(stickR.active || mouse.down) {
+             let aimX=0, aimY=0;
+             if(stickR.active){aimX=stickR.vx; aimY=stickR.vy;} else{let dx=mouse.x-canvas.width/2; let dy=mouse.y-canvas.height/2; aimX=dx; aimY=dy;}
+             player.angle = Math.atan2(aimY, aimX);
+        }
+        ctx.rotate(player.angle);
+        ctx.fillStyle = wpn.color; ctx.fillRect(10, -3, 20, 6);
+        ctx.restore();
+
+        if(!stickR.active) {
+            ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(player.x, player.y);
+            ctx.lineTo(player.x + Math.cos(player.angle)*100, player.y + Math.sin(player.angle)*100); ctx.stroke();
+        }
+
+        ctx.restore();
+        const drawJoy = (s,r) => { if(!s.active) return; let c=r?'255,50,50':'255,255,255'; ctx.beginPath(); ctx.arc(s.sx, s.sy, JOY_R, 0, Math.PI*2); ctx.fillStyle=`rgba(${c},0.1)`; ctx.fill(); ctx.strokeStyle=`rgba(${c},0.3)`; ctx.stroke(); ctx.beginPath(); ctx.arc(s.cx, s.cy, JOY_R/3, 0, Math.PI*2); ctx.fillStyle=`rgba(${c},0.5)`; ctx.fill(); }; drawJoy(stickL); drawJoy(stickR, true);
+    }
+    
+    function updateSet(k,v) { if(k==='god')state.godMode=v; if(k==='noclip')state.noclip=v; }
+    function resetGame() { state.level=1; state.isDead=false; state.transitioning=false; document.getElementById('game-over').style.display='none'; generateLevel(); }
+    window.addEventListener('mousemove', e=>{mouse.x=e.clientX; mouse.y=e.clientY;}); window.addEventListener('mousedown', ()=>mouse.down=true); window.addEventListener('mouseup', ()=>mouse.down=false); window.addEventListener('keydown', e=>keys[e.code]=true); window.addEventListener('keyup', e=>keys[e.code]=false);
+    const handleTouch = (e, end) => { if(e.target.id!=='restart-btn' && !e.target.closest('#controls') && !e.target.closest('#weapon-card') && !end) e.preventDefault(); if(end && e.changedTouches) { for(let i=0; i<e.changedTouches.length; i++) { let t=e.changedTouches[i]; if(t.identifier===stickL.id){stickL.active=false; stickL.vx=0; stickL.vy=0;} if(t.identifier===stickR.id){stickR.active=false; stickR.vx=0; stickR.vy=0;} } return; } let touches = e.touches || e.changedTouches; for(let i=0; i<touches.length; i++) { let t=touches[i]; let target=document.elementFromPoint(t.clientX, t.clientY); if(target&&(target.closest('#controls')||target.closest('#weapon-card'))) continue; if(!stickL.active && t.clientX<window.innerWidth/2) {stickL.active=true; stickL.id=t.identifier; stickL.sx=stickL.cx=t.clientX; stickL.sy=stickL.cy=t.clientY;} else if(!stickR.active && t.clientX>window.innerWidth/2) {stickR.active=true; stickR.id=t.identifier; stickR.sx=stickR.cx=t.clientX; stickR.sy=stickR.cy=t.clientY;} const updateStick = (s,x,y) => { s.cx=x; s.cy=y; let dx=x-s.sx, dy=y-s.sy, d=Math.sqrt(dx*dx+dy*dy); if(d>JOY_R){dx=(dx/d)*JOY_R; dy=(dy/d)*JOY_R; s.cx=s.sx+dx; s.cy=s.sy+dy;} if(d>5){s.vx=dx/JOY_R; s.vy=dy/JOY_R;}else{s.vx=0; s.vy=0;} }; if(stickL.active && t.identifier===stickL.id) updateStick(stickL, t.clientX, t.clientY); if(stickR.active && t.identifier===stickR.id) updateStick(stickR, t.clientX, t.clientY); } };
+    canvas.addEventListener('touchstart', e=>handleTouch(e, false), {passive:false}); canvas.addEventListener('touchmove', e=>handleTouch(e, false), {passive:false}); canvas.addEventListener('touchend', e=>handleTouch(e, true));
+    generateLevel(); let last=0; function loop(t) { let dt=t-last; last=t; update(); draw(); requestAnimationFrame(loop); } requestAnimationFrame(loop);
+</script>
+</body>
+</html>
